@@ -37,4 +37,9 @@ sympy==1.14.0
 torch==2.10.0
 torchvision==0.25.0
 triton==3.6.0
+transformers>=4.43.0
+accelerate>=0.27.0
+safetensors>=0.4.0
+datasets>=2.16.0
+tqdm>=4.66.0
 typing_extensions==4.15.0

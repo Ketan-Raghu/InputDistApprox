@@ -2,6 +2,7 @@
 
 import pytest
 from datasets import load_dataset
+import torch
 
 
 DATASET_NAME = "shibing624/sharegpt_gpt4"
