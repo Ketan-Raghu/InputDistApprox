@@ -42,7 +42,10 @@ class MetricsTracker:
     def avg_loss(self) -> float:
         if not self.loss_window:
             return 0.0
-        return sum(self.loss_window) / len(self.loss_window)
+        valid = [x for x in self.loss_window if not math.isnan(x)]
+        if not valid:
+            return float("nan")
+        return sum(valid) / len(valid)
 
     @property
     def tokens_per_sec(self) -> float:
@@ -196,8 +199,10 @@ def evaluate(model, dataloader, device=None, accelerator=None) -> float:
         if accelerator is not None:
             loss = accelerator.gather(loss).mean()
 
-        total_loss += loss.item()
-        total_steps += 1
+        loss_val = loss.item()
+        if not math.isnan(loss_val):
+            total_loss += loss_val
+            total_steps += 1
 
     model.train()
     return total_loss / max(total_steps, 1)

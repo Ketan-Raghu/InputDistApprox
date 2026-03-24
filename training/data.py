@@ -40,7 +40,7 @@ class FlippedConversationDataset(Dataset):
 
         logger.info(
             f"Loaded {len(self.examples)} conversations, skipped {skipped} "
-            f"(empty gpt responses)"
+            f"(empty gpt responses or no target tokens after truncation)"
         )
 
     def _load_conversations(self, data_path: str) -> List[dict]:
@@ -105,6 +105,10 @@ class FlippedConversationDataset(Dataset):
         # Truncate to max_seq_length
         input_ids = input_ids[: self.config.max_seq_length]
         labels = labels[: self.config.max_seq_length]
+
+        # Skip if truncation removed all target tokens (loss would be NaN)
+        if all(l == -100 for l in labels):
+            return None
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),

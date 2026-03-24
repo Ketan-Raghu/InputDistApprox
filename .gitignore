@@ -5,3 +5,4 @@ venv/
 *.pt
 *.pkl
 *.bin
+checkpoints/

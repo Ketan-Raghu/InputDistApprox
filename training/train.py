@@ -10,10 +10,12 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import math
 import os
 import sys
+from pathlib import Path
 
 import torch
 from tqdm import tqdm
@@ -225,8 +227,29 @@ def train_stage2(config: TrainingConfig, resume_from: str):
     # rank 0's weights to all ranks during prepare()
     model, tokenizer = load_and_prepare_model(config)
 
-    if resume_from and accelerator.is_main_process:
-        load_checkpoint(resume_from, model)
+    # Detect checkpoint format:
+    #   - Stage 1 / DDP: checkpoint.pt (single file with model+optimizer)
+    #   - Stage 2 FULL_STATE_DICT: pytorch_model_fsdp.bin (single file, legacy)
+    #   - Stage 2 SHARDED_STATE_DICT: pytorch_model_fsdp_0/ directory (per-rank shards)
+    resume_dir = Path(resume_from) if resume_from else None
+    is_sharded_fsdp = resume_dir and (resume_dir / "pytorch_model_fsdp_0").exists()
+    is_full_fsdp = resume_dir and (resume_dir / "pytorch_model_fsdp.bin").exists()
+
+    # Stage 1 and legacy FULL_STATE_DICT checkpoints: load model weights on
+    # rank 0 before FSDP wrapping — fsdp_sync_module_states broadcasts to all.
+    # FULL_STATE_DICT optimizer state is skipped (would OOM loading on every rank).
+    if resume_from and not is_sharded_fsdp and accelerator.is_main_process:
+        if is_full_fsdp:
+            state_dict = torch.load(
+                resume_dir / "pytorch_model_fsdp.bin",
+                map_location="cpu",
+                weights_only=True,
+            )
+            model.load_state_dict(state_dict)
+            del state_dict
+            logger.info(f"Loaded FULL_STATE_DICT model weights from {resume_from}")
+        else:
+            load_checkpoint(resume_from, model)
 
     unfreeze_all(model)
 
@@ -267,6 +290,30 @@ def train_stage2(config: TrainingConfig, resume_from: str):
         optimizer, train_loader, val_loader, scheduler
     )
 
+    # SHARDED_STATE_DICT checkpoints: load full state (model+optimizer+scheduler)
+    # after prepare(), since each rank only loads its own shard — memory-efficient.
+    global_step = 0
+    if is_sharded_fsdp:
+        accelerator.load_state(resume_from)
+        with open(resume_dir / "metadata.json") as f:
+            meta = json.load(f)
+        global_step = meta["global_step"]
+        if accelerator.is_main_process:
+            logger.info(
+                f"Resumed sharded FSDP checkpoint from {resume_from} "
+                f"(step={global_step})"
+            )
+    elif resume_from and (is_full_fsdp or (resume_dir / "checkpoint.pt").exists()):
+        # Model weights already loaded pre-FSDP; just restore global_step
+        with open(resume_dir / "metadata.json") as f:
+            meta = json.load(f)
+        global_step = meta["global_step"]
+        if accelerator.is_main_process:
+            logger.info(
+                f"Resumed model weights from {resume_from} (step={global_step}), "
+                f"optimizer restarted fresh"
+            )
+
     if accelerator.is_main_process:
         logger.info(
             f"Training steps: {num_training_steps}, warmup: {num_warmup_steps}, "
@@ -278,7 +325,6 @@ def train_stage2(config: TrainingConfig, resume_from: str):
 
     # Training loop
     model.train()
-    global_step = 0
 
     for epoch in range(config.stage2_epochs):
         if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
@@ -356,6 +402,12 @@ def train_stage2(config: TrainingConfig, resume_from: str):
             )
 
     # Save final model in HuggingFace format
+    # Free optimizer/scheduler first — gathering FSDP shards into a full state
+    # dict needs temporary CPU memory that would otherwise OOM.
+    del optimizer, scheduler
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
+
     if accelerator.is_main_process:
         logger.info("Saving final model in HuggingFace format...")
 
