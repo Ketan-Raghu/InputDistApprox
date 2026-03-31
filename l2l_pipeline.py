@@ -156,7 +156,7 @@ class L2LPipeline(nn.Module):
         # Base model — shared for Model A (generation) and Model B (reconstruction)
         print("Loading base model (frozen, shared for Model A & B)...")
         self.base_model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_path, torch_dtype=self.dtype,
+            cfg.model_path, dtype=self.dtype,
             device_map="auto", trust_remote_code=True,
         )
         for p in self.base_model.parameters():
@@ -175,7 +175,7 @@ class L2LPipeline(nn.Module):
         # Middle model — separate instance, partially reinitialized
         print("Loading middle model...")
         self.middle_model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_path, torch_dtype=self.dtype,
+            cfg.model_path, dtype=self.dtype,
             device_map="auto", trust_remote_code=True,
         )
 
@@ -198,6 +198,33 @@ class L2LPipeline(nn.Module):
 
         if cfg.gradient_checkpointing:
             self.middle_model.gradient_checkpointing_enable()
+
+        # Report model placement and memory
+        self._print_gpu_report()
+
+    def _print_gpu_report(self):
+        """Print per-GPU memory usage and model device maps."""
+        num_gpus = torch.cuda.device_count()
+        print(f"\nGPU memory report ({num_gpus} devices):")
+        total_mem = 0.0
+        for i in range(num_gpus):
+            mem = torch.cuda.memory_allocated(i) / (1024 ** 3)
+            total_mem += mem
+            print(f"  GPU {i}: {mem:.2f} GB allocated")
+        print(f"  Total: {total_mem:.2f} GB")
+
+        base_params = sum(p.numel() * p.element_size() for p in self.base_model.parameters()) / (1024 ** 3)
+        mid_params = sum(p.numel() * p.element_size() for p in self.middle_model.parameters()) / (1024 ** 3)
+        print(f"  Base model weight size: {base_params:.2f} GB")
+        print(f"  Middle model weight size: {mid_params:.2f} GB")
+
+        if hasattr(self.base_model, "hf_device_map"):
+            devices = set(self.base_model.hf_device_map.values())
+            print(f"  Base model devices: {sorted(devices)}")
+        if hasattr(self.middle_model, "hf_device_map"):
+            devices = set(self.middle_model.hf_device_map.values())
+            print(f"  Middle model devices: {sorted(devices)}")
+        print()
 
     # -- stage configuration ------------------------------------------------
 
@@ -260,9 +287,7 @@ class L2LPipeline(nn.Module):
             attention_mask=attention_mask,
             max_new_tokens=self.config.max_new_tokens,
             min_new_tokens=1,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.8,
+            do_sample=False,
             output_logits=True,
             return_dict_in_generate=True,
         )
@@ -339,6 +364,8 @@ class L2LPipeline(nn.Module):
         prob_vectors, mask = self.build_soft_sequence(
             raw_logits, gen_lengths, temperature,
         )
+        # Sanitize Model A probs (clip any nan/inf from bfloat16 softmax)
+        prob_vectors = prob_vectors.nan_to_num(nan=0.0, posinf=1.0, neginf=0.0)
 
         # 3. Middle model: soft embed -> transformer layers -> lm_head -> softmax
         mid_device = self._get_device(self.middle_model)
@@ -350,7 +377,11 @@ class L2LPipeline(nn.Module):
             attention_mask=mask.to(mid_device),
             use_cache=False,
         )
-        middle_probs = F.softmax(middle_out.logits, dim=-1)
+        # Clamp logits before softmax to prevent bfloat16 overflow from
+        # reinitialized layers, then sanitize any remaining nan/inf
+        middle_logits = middle_out.logits.float().clamp(-65504, 65504)
+        middle_probs = F.softmax(middle_logits, dim=-1).to(self.dtype)
+        middle_probs = middle_probs.nan_to_num(nan=0.0, posinf=1.0, neginf=0.0)
 
         # 4. Model B: weighted embed -> frozen transformer -> logits
         base_device = self._get_device(self.base_model)
@@ -368,8 +399,9 @@ class L2LPipeline(nn.Module):
         targets = prob_vectors[:, 1:, :].to(b_logits.device)
         shifted_mask = mask[:, 1:].to(b_logits.device)
 
-        log_probs = F.log_softmax(b_logits, dim=-1)
-        per_token_loss = -(targets * log_probs).sum(dim=-1)
+        log_probs = F.log_softmax(b_logits.float(), dim=-1)
+        # nan_to_num handles the 0 * -inf = NaN case in soft CE
+        per_token_loss = -(targets.float() * log_probs).nan_to_num(0.0).sum(dim=-1)
         loss = (per_token_loss * shifted_mask).sum() / shifted_mask.sum().clamp(min=1)
 
         return loss
@@ -420,7 +452,6 @@ def train_one_epoch(
     pbar = tqdm(dataloader, desc=f"Stage {stage} Epoch {epoch}")
     for batch_idx, batch in enumerate(pbar):
         temp = temperature_fn(global_step) if callable(temperature_fn) else temperature_fn
-        t0 = time.time()
 
         loss = pipeline(batch["input_ids"], batch["attention_mask"], temp)
         loss = loss / config.gradient_accumulation_steps
@@ -450,7 +481,6 @@ def train_one_epoch(
                 avg_loss = running_loss / max(num_losses, 1)
                 lr = optimizer.param_groups[0]["lr"]
                 gpu_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                elapsed = time.time() - t0
 
                 entry = {
                     "step": global_step,
