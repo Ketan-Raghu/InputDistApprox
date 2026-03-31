@@ -6,3 +6,4 @@ venv/
 *.pkl
 *.bin
 checkpoints/
+!data/merged_prompts.jsonl
