@@ -78,7 +78,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     stage1_temperature: float = 1.0
     stage2_temp_start: float = 1.0
-    stage2_temp_end: float = 0.05
+    stage2_temp_end: float = 0.00
     temp_schedule: str = "cosine"
     val_split: float = 0.02
     log_every: int = 10
@@ -157,6 +157,17 @@ class FastL2LPipeline(nn.Module):
             self._executor = ThreadPoolExecutor(max_workers=1)
             self._gen_future = None
 
+    @staticmethod
+    def _to(tensor, device):
+        """Transfer tensor to device via CPU.
+
+        Direct GPU-to-GPU P2P transfers silently produce zeros on some
+        multi-GPU systems. Routing through pinned CPU memory avoids this.
+        """
+        if tensor.device == device:
+            return tensor
+        return tensor.cpu().to(device)
+
     # -- setup --------------------------------------------------------------
 
     def _setup_hardware(self):
@@ -229,8 +240,9 @@ class FastL2LPipeline(nn.Module):
         # Cache Model B's embedding matrix on GPU 1 so the large
         # (B, S, 152064) middle_probs tensor stays on GPU 1 for the matmul.
         # Only the small (B, S, 3584) weighted_embeds crosses to GPU 2.
-        self._base_embed_cache = (
-            self.model_b.model.embed_tokens.weight.detach().clone().to(self.gpu_mid)
+        # Route via CPU to avoid P2P zero-out.
+        self._base_embed_cache = self._to(
+            self.model_b.model.embed_tokens.weight.detach().clone(), self.gpu_mid,
         )
 
         # Tokenizer
@@ -434,15 +446,12 @@ class FastL2LPipeline(nn.Module):
         """
         Differentiable forward through Middle Model + Model B -> loss.
 
-        prob_vectors / mask are on gpu_a (Model A's device). This method
-        handles all cross-GPU transfers, minimizing large tensor moves:
-          - prob_vectors (B, S, 152064) transferred to gpu_mid once
-          - weighted_embeds (B, S, 3584) transferred to gpu_b (40x smaller)
-          - targets (B, S-1, 152064) transferred to gpu_b for loss
+        prob_vectors / mask are on gpu_a (Model A's device). All cross-GPU
+        transfers route via CPU to avoid P2P zero-out issues.
         """
         # -- Middle model (GPU 1) --
-        prob_mid = prob_vectors.to(self.gpu_mid)
-        mask_mid = mask.to(self.gpu_mid)
+        prob_mid = self._to(prob_vectors, self.gpu_mid)
+        mask_mid = self._to(mask, self.gpu_mid)
 
         mid_embed = self._get_saveable_middle().model.embed_tokens.weight
         soft_embeds = prob_mid @ mid_embed  # (B, S, 3584)
@@ -463,15 +472,15 @@ class FastL2LPipeline(nn.Module):
 
         # -- Model B (GPU 2) — only (B, S, 3584) crosses GPUs --
         model_b_out = self.model_b(
-            inputs_embeds=weighted_embeds.to(self.gpu_b),
-            attention_mask=mask.to(self.gpu_b),
+            inputs_embeds=self._to(weighted_embeds, self.gpu_b),
+            attention_mask=self._to(mask, self.gpu_b),
             use_cache=False,
         )
 
         # -- Shifted autoregressive soft cross-entropy (GPU 2) --
         b_logits = model_b_out.logits[:, :-1, :]
-        targets = prob_vectors[:, 1:, :].to(self.gpu_b)
-        shifted_mask = mask[:, 1:].to(self.gpu_b)
+        targets = self._to(prob_vectors[:, 1:, :], self.gpu_b)
+        shifted_mask = self._to(mask[:, 1:], self.gpu_b)
 
         log_probs = F.log_softmax(b_logits.float(), dim=-1)
         per_token_loss = -(targets.float() * log_probs).nan_to_num(0.0).sum(dim=-1)
@@ -563,6 +572,36 @@ def save_checkpoint(pipeline, optimizer, scheduler, stage, step, epoch, temp, pa
         path,
     )
     print(f"  Checkpoint saved: {path}")
+
+
+def load_checkpoint(path, pipeline, optimizer=None, scheduler=None):
+    """
+    Load a checkpoint. Returns dict with 'stage', 'step', 'epoch', 'temperature'.
+
+    Restores middle model weights. Optionally restores optimizer/scheduler
+    state if provided (only meaningful when resuming the same stage).
+    """
+    print(f"Loading checkpoint: {path}")
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+    # Load middle model weights (handles cross-device mapping automatically)
+    pipeline._get_saveable_middle().load_state_dict(ckpt["middle_model_state_dict"])
+    print(f"  Restored middle model weights (stage {ckpt['stage']}, step {ckpt['step']})")
+
+    if optimizer is not None and "optimizer_state_dict" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        print(f"  Restored optimizer state")
+
+    if scheduler is not None and "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        print(f"  Restored scheduler state")
+
+    return {
+        "stage": ckpt["stage"],
+        "step": ckpt["step"],
+        "epoch": ckpt["epoch"],
+        "temperature": ckpt.get("temperature", 1.0),
+    }
 
 
 def train_one_epoch(
@@ -748,6 +787,10 @@ def main():
     parser.add_argument("--no-async-prefetch", dest="async_prefetch", action="store_false")
     parser.add_argument("--compile", dest="compile_models", action="store_true", default=False)
     parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Path to checkpoint to resume from (skips completed stages)",
+    )
     args = parser.parse_args()
 
     config = TrainingConfig(
@@ -820,46 +863,61 @@ def main():
     effective_batch = config.batch_size * config.gradient_accumulation_steps
     print(f"  Effective batch size: {config.batch_size} x {config.gradient_accumulation_steps} = {effective_batch}")
 
-    # -- Stage 1 ------------------------------------------------------------
-    print(f"\n{'=' * 60}")
-    print("STAGE 1: Train reinitialized layers only")
-    print(f"{'=' * 60}")
-    pipeline.configure_stage1()
+    # -- Resume handling ----------------------------------------------------
+    resume_stage = 0  # 0 = start fresh, 1 = stage 1 done, 2 = stage 2 mid
+    resume_step = 0
+    resume_epoch = 0
+    if args.resume:
+        ckpt_info = load_checkpoint(args.resume, pipeline)
+        resume_stage = ckpt_info["stage"]
+        resume_step = ckpt_info["step"]
+        resume_epoch = ckpt_info["epoch"]
+        print(f"  Resumed from stage {resume_stage}, step {resume_step}, epoch {resume_epoch}")
 
-    total_params = sum(p.numel() for p in pipeline.middle_model.parameters())
-    trainable = sum(p.numel() for p in pipeline.middle_model.parameters() if p.requires_grad)
-    print(f"  Trainable: {trainable:,} / {total_params:,} ({100 * trainable / total_params:.1f}%)")
-
-    param_groups = pipeline.get_param_groups(stage=1)
-    optimizer = torch.optim.AdamW(
-        param_groups, weight_decay=config.weight_decay, fused=True,
-    )
     steps_per_epoch = len(train_loader) // config.gradient_accumulation_steps
-    total_s1 = steps_per_epoch * config.stage1_epochs
-    warmup_s1 = int(total_s1 * config.warmup_ratio)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_s1, total_s1)
+    total_params = sum(p.numel() for p in pipeline.middle_model.parameters())
 
-    global_step = 0
-    for epoch in range(config.stage1_epochs):
-        global_step = train_one_epoch(
-            pipeline, train_loader, optimizer, scheduler,
-            stage=1, epoch=epoch, global_step=global_step,
-            temperature_fn=config.stage1_temperature,
-            log_path=log_path, config=config,
+    # -- Stage 1 ------------------------------------------------------------
+    if resume_stage < 1:
+        print(f"\n{'=' * 60}")
+        print("STAGE 1: Train reinitialized layers only")
+        print(f"{'=' * 60}")
+        pipeline.configure_stage1()
+
+        trainable = sum(p.numel() for p in pipeline.middle_model.parameters() if p.requires_grad)
+        print(f"  Trainable: {trainable:,} / {total_params:,} ({100 * trainable / total_params:.1f}%)")
+
+        param_groups = pipeline.get_param_groups(stage=1)
+        optimizer = torch.optim.AdamW(
+            param_groups, weight_decay=config.weight_decay, fused=True,
         )
-        val_loss = validate(pipeline, val_loader, config.stage1_temperature)
-        print(f"  Stage 1 Epoch {epoch} val_loss: {val_loss:.4f}")
-        with open(log_path, "a") as f:
-            f.write(json.dumps({
-                "step": global_step, "epoch": epoch,
-                "stage": "stage1_val", "val_loss": round(val_loss, 6),
-            }) + "\n")
+        total_s1 = steps_per_epoch * config.stage1_epochs
+        warmup_s1 = int(total_s1 * config.warmup_ratio)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_s1, total_s1)
 
-    save_checkpoint(
-        pipeline, optimizer, scheduler, 1, global_step, epoch,
-        config.stage1_temperature,
-        os.path.join(config.checkpoint_dir, "stage1_final.pt"),
-    )
+        global_step = 0
+        for epoch in range(config.stage1_epochs):
+            global_step = train_one_epoch(
+                pipeline, train_loader, optimizer, scheduler,
+                stage=1, epoch=epoch, global_step=global_step,
+                temperature_fn=config.stage1_temperature,
+                log_path=log_path, config=config,
+            )
+            val_loss = validate(pipeline, val_loader, config.stage1_temperature)
+            print(f"  Stage 1 Epoch {epoch} val_loss: {val_loss:.4f}")
+            with open(log_path, "a") as f:
+                f.write(json.dumps({
+                    "step": global_step, "epoch": epoch,
+                    "stage": "stage1_val", "val_loss": round(val_loss, 6),
+                }) + "\n")
+
+        save_checkpoint(
+            pipeline, optimizer, scheduler, 1, global_step, epoch,
+            config.stage1_temperature,
+            os.path.join(config.checkpoint_dir, "stage1_final.pt"),
+        )
+    else:
+        print(f"\n  Skipping Stage 1 (already completed in checkpoint)")
 
     # -- Stage 2 ------------------------------------------------------------
     print(f"\n{'=' * 60}")
@@ -884,8 +942,17 @@ def main():
             config.stage2_temp_start, config.stage2_temp_end,
         )
 
+    # Resume mid-stage-2 if applicable
     s2_step = 0
-    for epoch in range(config.stage2_epochs):
+    s2_start_epoch = 0
+    if resume_stage == 2:
+        s2_step = resume_step
+        s2_start_epoch = resume_epoch
+        # Restore optimizer/scheduler for same-stage resume
+        load_checkpoint(args.resume, pipeline, optimizer, scheduler)
+        print(f"  Resuming Stage 2 from step {s2_step}, epoch {s2_start_epoch}")
+
+    for epoch in range(s2_start_epoch, config.stage2_epochs):
         s2_step = train_one_epoch(
             pipeline, train_loader, optimizer, scheduler,
             stage=2, epoch=epoch, global_step=s2_step,
