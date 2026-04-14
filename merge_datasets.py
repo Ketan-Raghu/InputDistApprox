@@ -1,4 +1,9 @@
-"""Merge input prompts from the ShareGPT and harmful datasets into one shuffled dataset."""
+"""Merge input prompts from the ShareGPT and harmful datasets into one shuffled dataset.
+
+Both datasets are pulled from HuggingFace:
+  - shibing624/sharegpt_gpt4: first human turn from each conversation
+  - LLM-LAT/harmful-dataset: prompt field
+"""
 
 import json
 import random
@@ -7,24 +12,23 @@ from pathlib import Path
 from datasets import load_dataset
 
 
-SHAREGPT_PATH = Path("data/sharegpt_llama3.1_8b/sharegpt_llama3.1_8b.jsonl")
+SHAREGPT_DATASET = "shibing624/sharegpt_gpt4"
 HARMFUL_DATASET = "LLM-LAT/harmful-dataset"
 OUTPUT_PATH = Path("data/merged_prompts.jsonl")
 
 
-def extract_sharegpt_prompts(path: Path) -> list[dict]:
+def extract_sharegpt_prompts() -> list[dict]:
     """Extract the first human turn from each ShareGPT conversation."""
+    ds = load_dataset(SHAREGPT_DATASET, split="train")
     prompts = []
-    with open(path, "r") as f:
-        for line in f:
-            entry = json.loads(line)
-            for turn in entry["conversations"]:
-                if turn["from"] == "human":
-                    prompts.append({
-                        "prompt": turn["value"],
-                        "source": "sharegpt",
-                    })
-                    break  # only take the first human turn per conversation
+    for row in ds:
+        for turn in row["conversations"]:
+            if turn["from"] == "human":
+                prompts.append({
+                    "prompt": turn["value"],
+                    "source": "sharegpt",
+                })
+                break  # only take the first human turn per conversation
     return prompts
 
 
@@ -44,11 +48,10 @@ def main():
     parser = argparse.ArgumentParser(description="Merge ShareGPT and harmful dataset prompts.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling")
     parser.add_argument("--output", type=str, default=str(OUTPUT_PATH), help="Output JSONL path")
-    parser.add_argument("--sharegpt-path", type=str, default=str(SHAREGPT_PATH), help="Path to ShareGPT JSONL")
     args = parser.parse_args()
 
-    print(f"Loading ShareGPT prompts from {args.sharegpt_path} ...")
-    sharegpt_prompts = extract_sharegpt_prompts(Path(args.sharegpt_path))
+    print(f"Loading ShareGPT prompts from HuggingFace ({SHAREGPT_DATASET}) ...")
+    sharegpt_prompts = extract_sharegpt_prompts()
     print(f"  -> {len(sharegpt_prompts)} prompts")
 
     print(f"Loading harmful prompts from HuggingFace ({HARMFUL_DATASET}) ...")

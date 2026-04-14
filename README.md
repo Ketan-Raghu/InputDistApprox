@@ -1,101 +1,96 @@
-# Input Distribution Approximation (L2L)
+# Input Distribution Approximation — T2T Pipeline
 
-A training pipeline for learning to approximate input distributions between frozen Qwen2.5-7B-Instruct model instances using a trainable intermediary model.
+Train a partially-reinitialized Qwen2.5-7B-Instruct to **predict the original input prompt given a single model output**. Each prompt generates 5 independent outputs (one per GPU via different seeds), and each (output, prompt) pair is a separate training sample.
+
+## Running the Full Pipeline
+
+```bash
+# 1. Merge datasets (if data/merged_prompts.jsonl doesn't exist)
+python merge_datasets.py
+
+# 2. Validate sampling diversity (optional, requires 1 GPU)
+pytest test_t2t_sampling_diversity.py -v
+
+# 3. Generate training pairs (5 GPUs, ~456K pairs)
+python generate_t2t_outputs.py --num-gpus 5
+
+# 4. Train (DDP across 5 GPUs)
+torchrun --nproc_per_node=5 train_t2t.py
+```
 
 ## Architecture
 
-Three Qwen2.5-7B-Instruct model roles form a differentiable chain:
-
 ```
-Prompt -> [Model A (frozen)] -> softmax(logits / temp)
-       -> prepend <|im_start|>assistant, append <|im_start|>user
-       -> [Middle Model (trainable)] -> embed_tokens -> layers -> lm_head (frozen) -> softmax
-       -> [Model B (frozen)] -> embed_tokens -> layers -> logits
-       -> CE loss vs Model A targets (shifted autoregressive)
+merged_prompts.jsonl (91K prompts)
+        |
+        v
+  generate_t2t_outputs.py
+  5 GPUs, each with seed=42+gpu_id
+  Each generates 1 output per prompt (temp=0.9)
+        |
+        v
+  data/t2t_training_pairs.jsonl (~456K rows)
+  Format: {"prompt": "...", "output": "...", "gpu_id": N}
+        |
+        v
+  train_t2t.py (torchrun --nproc=5)
+  Model: Qwen2.5-7B-Instruct, layers 24-27 reinitialized
+  Input:  system + user:{model_output} + assistant:{original_prompt}
+  Loss:   CE on assistant tokens only
+        |
+        v
+  checkpoints/t2t/final_model/
 ```
 
-- **Model A** (frozen): Generates soft probability sequences from prompts via autoregressive generation
-- **Middle Model** (partially trainable): Qwen2.5-7B copy with reinitialized `embed_tokens` and last 8 transformer layers (20-27). The `lm_head` remains frozen
-- **Model B** (frozen): Receives the middle model's output mapped back into embedding space and reconstructs Model A's probability distributions
+## Training Stages
 
-Model A and B share one frozen model instance to save memory.
+**Epoch 0 — Stabilization:** Only reinit layers (24-27) trainable, `lr=2e-4`
 
-## Training
-
-Two-stage training process:
-
-**Stage 1** (1 epoch) — Train only the reinitialized parameters:
-- `embed_tokens` weight matrix
-- Transformer layers 20-27
-
-**Stage 2** (configurable epochs) — Full finetune of the middle model:
-- Two-tier learning rate: lower for pretrained layers (0-19), higher for reinitialized layers
-- `lm_head` remains frozen throughout
-- Model A's softmax temperature decays (cosine schedule, 1.0 -> 0.05) so the middle model gradually learns to interpret discrete token distributions
+**Epochs 1-3 — Full fine-tuning:** All params trainable, 2-tier LR:
+- Reinit layers (24-27): `lr=1e-4`
+- Pretrained layers: `lr=1e-5`
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `l2l_pipeline.py` | Main training pipeline (Model A -> Middle -> Model B) |
-| `qwen_logit_inference.py` | Batch logit extraction from Qwen2.5-7B-Instruct |
-| `reinit_qwen_layers.py` | Reinitialize last N transformer layers of a Qwen model |
-| `merge_datasets.py` | Merge ShareGPT and harmful-dataset into `merged_prompts.jsonl` |
-| `data/merged_prompts.jsonl` | 91,342 prompts (ShareGPT + LLM-LAT/harmful-dataset) |
+| `generate_t2t_outputs.py` | 5-GPU parallel output generation with seed-based diversity |
+| `train_t2t.py` | DDP training: stabilization epoch then full finetune |
+| `test_t2t_sampling_diversity.py` | Pytest: validates seed-based sampling produces diverse outputs |
+| `reinit_qwen_layers.py` | `reinit_module()` — resets layer params to normal(0, 0.02) |
+| `merge_datasets.py` | Merge ShareGPT + harmful-dataset into `merged_prompts.jsonl` |
 
-## Usage
+## Key Arguments
 
-### Training
-
-```bash
-python l2l_pipeline.py \
-  --batch-size 2 \
-  --gradient-accumulation-steps 8 \
-  --max-new-tokens 256 \
-  --stage1-epochs 1 \
-  --stage2-epochs 3
-```
-
-Key arguments:
+### Generation (`generate_t2t_outputs.py`)
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--batch-size` | 2 | Prompts per forward pass |
-| `--gradient-accumulation-steps` | 8 | Steps before optimizer update (effective batch = 16) |
-| `--max-new-tokens` | 256 | Max tokens Model A generates per prompt |
-| `--stage1-lr` | 2e-4 | Learning rate for stage 1 |
-| `--stage2-lr-high` | 1e-4 | LR for reinitialized layers in stage 2 |
-| `--stage2-lr-low` | 1e-5 | LR for pretrained layers in stage 2 |
-| `--temp-end` | 0.05 | Final temperature in stage 2 |
-| `--temp-schedule` | cosine | Temperature decay schedule (`cosine` or `linear`) |
-| `--checkpoint-dir` | `checkpoints/l2l/` | Where to save checkpoints |
+| `--batch-size` | 64 | Prompts per forward pass per GPU |
+| `--max-new-tokens` | 512 | Max tokens generated per output |
+| `--temperature` | 0.9 | Sampling temperature |
+| `--num-gpus` | 5 | Number of GPUs for parallel generation |
+| `--resume` | off | Resume from existing per-GPU output files |
+| `--merge-only` | off | Skip generation, just merge existing files |
 
-### Logit Extraction
+### Training (`train_t2t.py`)
 
-```bash
-python qwen_logit_inference.py --batch-size 16 --output /tmp/qwen_logits.buf
-```
-
-Streams the full 152,064-dim logit vector (float16) for each prompt to a binary buffer file.
-
-### Layer Reinitialization
-
-```bash
-python reinit_qwen_layers.py --num-reinit-layers 8 --output-dir models/qwen2.5-7b-reinit-last8
-```
-
-### Dataset Preparation
-
-```bash
-python merge_datasets.py --seed 42 --output data/merged_prompts.jsonl
-```
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--batch-size` | 2 | Per-GPU batch size |
+| `--gradient-accumulation-steps` | 4 | Accumulation steps (effective batch = 2 x 4 x 5 = 40) |
+| `--stabilization-lr` | 2e-4 | LR for stabilization epoch |
+| `--lr-high` | 1e-4 | LR for reinit layers in full finetune |
+| `--lr-low` | 1e-5 | LR for pretrained layers in full finetune |
+| `--max-seq-len` | 2048 | Max total sequence length |
+| `--resume-from` | none | Path to checkpoint to resume from |
 
 ## Requirements
 
 - Python 3.10+
-- PyTorch 2.10+
+- PyTorch 2.1+
 - Transformers >= 4.43.0
-- Accelerate >= 0.27.0
+- 5 GPUs with >= 96 GB each (stabilization ~30 GB/GPU, full training ~95 GB/GPU)
 - Qwen2.5-7B-Instruct model weights
 
 ```bash
