@@ -25,9 +25,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Constants
 # ---------------------------------------------------------------------------
 MODEL_PATH = "/home/ketan/LLMs/models/Qwen_Qwen2.5-7B-Instruct/"
-CHECKPOINT_PATH = os.path.join(
-    os.path.dirname(__file__), "checkpoints", "l2l_fast", "stage1_final.pt",
-)
+# CHECKPOINT_PATH = os.path.join(
+#     os.path.dirname(__file__), "checkpoints", "l2l_fast", "stage1_final.pt",
+# )
+CHECKPOINT_PATH = "checkpoints/l2l_stable_fast_old6/stage1_final.pt"
 
 IM_START_ID = 151644
 IM_END_ID = 151645
